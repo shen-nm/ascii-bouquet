@@ -1,0 +1,695 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>For You — 3D ASCII Bouquet</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: #09090b;
+      color: #e4e4e7;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      overflow: hidden;
+      user-select: none;
+    }
+    #canvas-container {
+      position: fixed;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .panel {
+      position: fixed;
+      top: 1.25rem;
+      right: 1.25rem;
+      width: 275px;
+      background: rgba(16, 16, 22, 0.84);
+      backdrop-filter: blur(12px);
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      border-radius: 12px;
+      padding: 1rem;
+      z-index: 10;
+      transition: transform 0.25s ease, opacity 0.25s ease;
+    }
+    .panel.collapsed {
+      transform: translateY(-8px);
+      opacity: 0;
+      pointer-events: none;
+    }
+    .toggle-btn {
+      position: fixed;
+      top: 1.25rem;
+      right: 1.25rem;
+      z-index: 20;
+      background: rgba(16, 16, 22, 0.88);
+      color: #e4e4e7;
+      border: 1px solid rgba(255, 255, 255, 0.15);
+      border-radius: 8px;
+      padding: 0.45rem 0.75rem;
+      font-family: inherit;
+      font-size: 0.8rem;
+      cursor: pointer;
+    }
+    .toggle-btn:hover { border-color: rgba(255, 255, 255, 0.35); }
+    h2 {
+      font-size: 0.82rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: #a1a1aa;
+      margin-bottom: 0.75rem;
+    }
+    .flower-list {
+      display: flex;
+      flex-direction: column;
+      gap: 0.45rem;
+      margin-bottom: 1rem;
+    }
+    .flower-item {
+      display: flex;
+      align-items: center;
+      gap: 0.55rem;
+      font-size: 0.85rem;
+      cursor: pointer;
+      padding: 0.3rem 0.45rem;
+      border-radius: 6px;
+      transition: background 0.15s;
+    }
+    .flower-item:hover { background: rgba(255, 255, 255, 0.06); }
+    .swatch {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      display: inline-block;
+    }
+    .row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 0.85rem;
+      font-size: 0.82rem;
+    }
+    input[type="text"] {
+      width: 100%;
+      background: rgba(255, 255, 255, 0.06);
+      border: 1px solid rgba(255, 255, 255, 0.14);
+      border-radius: 6px;
+      padding: 0.45rem 0.6rem;
+      color: #fff;
+      font-family: inherit;
+      font-size: 0.82rem;
+      margin-bottom: 0.75rem;
+    }
+    input[type="text"]:focus { outline: none; border-color: #f472b6; }
+    .btn-share {
+      width: 100%;
+      padding: 0.5rem;
+      background: #f472b6;
+      color: #09090b;
+      font-weight: 700;
+      font-family: inherit;
+      font-size: 0.82rem;
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+    }
+    .btn-share:hover { background: #f9a8d4; }
+    .note-display {
+      position: fixed;
+      bottom: 1.75rem;
+      left: 50%;
+      transform: translateX(-50%);
+      text-align: center;
+      pointer-events: none;
+      z-index: 5;
+      max-width: 90vw;
+    }
+    .note-text {
+      font-size: 1.05rem;
+      color: #fce7f3;
+      text-shadow: 0 2px 14px rgba(0, 0, 0, 0.95);
+      letter-spacing: 0.03em;
+    }
+    .hint {
+      font-size: 0.72rem;
+      color: #71717a;
+      margin-top: 0.35rem;
+    }
+  </style>
+
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://unpkg.com/three@0.169.0/build/three.module.js",
+        "three/addons/": "https://unpkg.com/three@0.169.0/examples/jsm/"
+      }
+    }
+  </script>
+</head>
+<body>
+  <div id="canvas-container"></div>
+  <button class="toggle-btn" id="toggle-ui">Customize Bouquet</button>
+
+  <div class="panel collapsed" id="control-panel">
+    <h2>Pick Your Flowers</h2>
+    <div class="flower-list" id="flower-list"></div>
+
+    <div class="row">
+      <span>Ribbon Color</span>
+      <input type="color" id="ribbon-color" value="#f43f5e" />
+    </div>
+
+    <input type="text" id="note-input" placeholder="Write a gift note..." maxlength="80" />
+    <button class="btn-share" id="copy-link">Copy Shareable Link</button>
+  </div>
+
+  <div class="note-display">
+    <div class="note-text" id="note-text"></div>
+    <div class="hint">drag to rotate &middot; scroll to zoom</div>
+  </div>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { AsciiEffect } from 'three/addons/effects/AsciiEffect.js';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+    const FLOWER_TYPES = {
+      rose: { label: 'Velvet Roses', color: '#fb365c', count: 5 },
+      lily: { label: 'Stargazer Lilies', color: '#ff85b3', count: 4 },
+      sunflower: { label: 'Sunflowers', color: '#facc15', count: 3 },
+      tulip: { label: 'French Tulips', color: '#fb7185', count: 5 },
+      eucalyptus: { label: 'Silver Eucalyptus', color: '#5eead4', count: 5 }
+    };
+
+    const params = new URLSearchParams(window.location.search);
+    const initialFlowers = params.get('flowers')
+      ? params.get('flowers').split(',').filter(k => FLOWER_TYPES[k])
+      : ['rose', 'lily', 'eucalyptus'];
+
+    const state = {
+      selected: new Set(initialFlowers.length ? initialFlowers : ['rose']),
+      ribbon: params.get('ribbon') || '#f43f5e',
+      note: params.get('note') || 'A little bouquet that never wilts'
+    };
+
+    // Scene & Studio Lighting
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(42, window.innerWidth / window.innerHeight, 0.1, 100);
+    camera.position.set(0, 2.4, 8.2);
+
+    scene.add(new THREE.AmbientLight(0xffffff, 0.3));
+
+    const keyLight = new THREE.DirectionalLight(0xfff5f7, 2.3);
+    keyLight.position.set(5, 9, 6);
+    scene.add(keyLight);
+
+    const fillLight = new THREE.DirectionalLight(0xc7d2fe, 0.65);
+    fillLight.position.set(-6, 2, 3);
+    scene.add(fillLight);
+
+    const rimLight = new THREE.DirectionalLight(0xffffff, 1.4);
+    rimLight.position.set(0, 6, -7);
+    scene.add(rimLight);
+
+    // Performance-optimized ASCII Renderer
+    const renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: 'high-performance' });
+    renderer.setPixelRatio(1);
+
+    const getOptimalResolution = () => (window.innerWidth < 600 ? 0.16 : 0.22);
+    const ramp = ' .:-=+*#%@';
+    const effect = new AsciiEffect(renderer, ramp, {
+      invert: true,
+      color: true,
+      resolution: getOptimalResolution()
+    });
+    effect.setSize(window.innerWidth, window.innerHeight);
+    effect.domElement.style.backgroundColor = '#09090b';
+    document.getElementById('canvas-container').appendChild(effect.domElement);
+
+    const controls = new OrbitControls(camera, effect.domElement);
+    controls.enableDamping = true;
+    controls.autoRotate = true;
+    controls.autoRotateSpeed = 1.4;
+    controls.target.set(0, 0.35, 0);
+
+    const bouquetGroup = new THREE.Group();
+    scene.add(bouquetGroup);
+
+    // Helper: create a curved, cupped petal mesh
+    function createCurvedPetal(width, length, cupDepth, curlBack) {
+      const geom = new THREE.PlaneGeometry(width, length, 5, 8);
+      geom.translate(0, length * 0.5, 0);
+      const pos = geom.attributes.position;
+
+      for (let i = 0; i < pos.count; i++) {
+        const x = pos.getX(i);
+        const y = pos.getY(i);
+        const u = x / (width * 0.5);
+        const v = y / length;
+
+        const widthProfile = Math.sin(Math.pow(v, 0.72) * Math.PI);
+        pos.setX(i, x * widthProfile);
+
+        const cup = (1 - u * u) * Math.sin(v * Math.PI) * cupDepth;
+        const arch = Math.pow(v, 1.8) * curlBack;
+        pos.setZ(i, cup - arch);
+      }
+      geom.computeVertexNormals();
+      return geom;
+    }
+
+    // Helper: curved botanical leaf
+    function createBotanicalLeaf(width, length) {
+      const geom = new THREE.PlaneGeometry(width, length, 4, 7);
+      geom.translate(0, length * 0.5, 0);
+      const pos = geom.attributes.position;
+      for (let i = 0; i < pos.count; i++) {
+        const x = pos.getX(i);
+        const y = pos.getY(i);
+        const u = Math.abs(x / (width * 0.5));
+        const v = y / length;
+        const profile = Math.sin(Math.pow(v, 0.65) * Math.PI);
+        pos.setX(i, x * profile);
+        const vFold = u * 0.08;
+        const droop = Math.pow(v, 2.1) * 0.35;
+        pos.setZ(i, vFold - droop);
+      }
+      geom.computeVertexNormals();
+      return geom;
+    }
+
+    const leafGeom = createBotanicalLeaf(0.45, 1.05);
+    const stemMat = new THREE.MeshStandardMaterial({
+      color: 0x22c55e,
+      roughness: 0.55,
+      side: THREE.DoubleSide
+    });
+
+    function createStem(height, tipPos) {
+      const curve = new THREE.CatmullRomCurve3([
+        new THREE.Vector3(tipPos.x * -0.15, -2.3, tipPos.z * -0.15),
+        new THREE.Vector3(0, -1.35, 0),
+        new THREE.Vector3(tipPos.x * 0.45, height * 0.35, tipPos.z * 0.45),
+        new THREE.Vector3(tipPos.x, height, tipPos.z)
+      ]);
+      const geom = new THREE.TubeGeometry(curve, 12, 0.038, 6, false);
+      const mesh = new THREE.Mesh(geom, stemMat);
+
+      for (let s = 0; s < 2; s++) {
+        const t = 0.58 + s * 0.14;
+        const pt = curve.getPoint(t);
+        const leaf = new THREE.Mesh(leafGeom, stemMat);
+        leaf.position.copy(pt);
+        leaf.rotation.y = s * Math.PI + Math.atan2(tipPos.x, tipPos.z);
+        leaf.rotation.x = 0.75;
+        mesh.add(leaf);
+      }
+      return mesh;
+    }
+
+    // 1. Sculpted Velvet Rose
+    const roseInnerPetal = createCurvedPetal(0.42, 0.55, 0.16, 0.05);
+    const roseOuterPetal = createCurvedPetal(0.62, 0.72, 0.18, 0.24);
+    function createRoseHead() {
+      const head = new THREE.Group();
+      const innerMat = new THREE.MeshStandardMaterial({
+        color: 0xbe123c,
+        roughness: 0.5,
+        side: THREE.DoubleSide
+      });
+      const outerMat = new THREE.MeshStandardMaterial({
+        color: 0xfb365c,
+        roughness: 0.38,
+        side: THREE.DoubleSide
+      });
+
+      const totalPetals = 16;
+      for (let i = 0; i < totalPetals; i++) {
+        const isOuter = i >= 7;
+        const petal = new THREE.Mesh(
+          isOuter ? roseOuterPetal : roseInnerPetal,
+          isOuter ? outerMat : innerMat
+        );
+        const angle = i * 2.39996;
+        const ring = i / totalPetals;
+        petal.position.set(
+          Math.cos(angle) * (0.03 + ring * 0.14),
+          -ring * 0.06,
+          Math.sin(angle) * (0.03 + ring * 0.14)
+        );
+        petal.rotation.y = -angle + Math.PI / 2;
+        petal.rotation.x = 0.18 + ring * 0.72;
+        head.add(petal);
+      }
+      return head;
+    }
+
+    // 2. Stargazer Lily
+    const lilyPetalGeom = createCurvedPetal(0.48, 1.15, 0.12, 0.42);
+    function createLilyHead() {
+      const head = new THREE.Group();
+      const petalMat = new THREE.MeshStandardMaterial({
+        color: 0xff85b3,
+        emissive: 0x3b0722,
+        roughness: 0.35,
+        side: THREE.DoubleSide
+      });
+      for (let i = 0; i < 6; i++) {
+        const angle = (i / 6) * Math.PI * 2;
+        const petal = new THREE.Mesh(lilyPetalGeom, petalMat);
+        petal.rotation.y = angle;
+        petal.rotation.x = 0.85 + (i % 2) * 0.12;
+        head.add(petal);
+      }
+      const stamenMat = new THREE.MeshStandardMaterial({ color: 0xfde047 });
+      const filamentGeom = new THREE.CylinderGeometry(0.012, 0.012, 0.65, 5);
+      filamentGeom.translate(0, 0.32, 0);
+      const antherGeom = new THREE.SphereGeometry(0.045, 5, 4);
+      antherGeom.scale(0.6, 1.6, 0.6);
+
+      for (let i = 0; i < 5; i++) {
+        const a = (i / 5) * Math.PI * 2;
+        const fil = new THREE.Mesh(filamentGeom, stemMat);
+        fil.rotation.z = 0.25;
+        fil.rotation.y = a;
+        const anther = new THREE.Mesh(antherGeom, stamenMat);
+        anther.position.y = 0.65;
+        fil.add(anther);
+        head.add(fil);
+      }
+      return head;
+    }
+
+    // 3. Sunflower (fixed radial pivot so petals fan outward cleanly around the seed disc)
+    const sunRayGeom = createCurvedPetal(0.24, 0.72, 0.04, 0.1);
+    function createSunflowerHead() {
+      const head = new THREE.Group();
+
+      // Dark brown seed center
+      const discMat = new THREE.MeshStandardMaterial({ color: 0x451a03, roughness: 0.9 });
+      const discGeom = new THREE.SphereGeometry(0.44, 14, 10);
+      discGeom.scale(1, 0.28, 1);
+      head.add(new THREE.Mesh(discGeom, discMat));
+
+      // Ring of golden florets around the disc rim
+      const floretMat = new THREE.MeshStandardMaterial({ color: 0xd97706 });
+      const floretGeom = new THREE.SphereGeometry(0.045, 5, 4);
+      for (let i = 0; i < 16; i++) {
+        const a = (i / 16) * Math.PI * 2;
+        const dot = new THREE.Mesh(floretGeom, floretMat);
+        dot.position.set(Math.cos(a) * 0.38, 0.06, Math.sin(a) * 0.38);
+        head.add(dot);
+      }
+
+      // Two staggered rings of yellow petals radiating outward in the XZ plane
+      const rayMat = new THREE.MeshStandardMaterial({
+        color: 0xfacc15,
+        roughness: 0.4,
+        side: THREE.DoubleSide
+      });
+      const rayCount = 22;
+      for (let i = 0; i < rayCount; i++) {
+        const angle = (i / rayCount) * Math.PI * 2;
+        const pivot = new THREE.Group();
+        pivot.rotation.y = angle;
+
+        const ray = new THREE.Mesh(sunRayGeom, rayMat);
+        ray.position.set(0, 0, 0.36);
+        // Lay flat radially outward (+Z) with alternating slight tilt
+        ray.rotation.x = Math.PI / 2 + (i % 2 === 0 ? -0.14 : 0.06);
+
+        pivot.add(ray);
+        head.add(pivot);
+      }
+
+      // Tilt the bloom face slightly forward like a real sunflower
+      head.rotation.x = 0.65;
+      return head;
+    }
+
+    // 4. French Tulip
+    const tulipPetalGeom = createCurvedPetal(0.46, 0.88, 0.24, -0.08);
+    function createTulipHead() {
+      const head = new THREE.Group();
+      const mat = new THREE.MeshStandardMaterial({
+        color: 0xfb7185,
+        roughness: 0.32,
+        side: THREE.DoubleSide
+      });
+      for (let i = 0; i < 6; i++) {
+        const isInner = i % 2 === 0;
+        const angle = (i / 6) * Math.PI * 2;
+        const petal = new THREE.Mesh(tulipPetalGeom, mat);
+        const r = isInner ? 0.07 : 0.11;
+        petal.position.set(Math.cos(angle) * r, 0, Math.sin(angle) * r);
+        petal.rotation.y = -angle + Math.PI / 2;
+        petal.rotation.x = isInner ? 0.06 : 0.16;
+        head.add(petal);
+      }
+      return head;
+    }
+
+    // 5. Silver Dollar Eucalyptus Sprig
+    function createEucalyptusSprig(height, tipPos) {
+      const group = new THREE.Group();
+      const curve = new THREE.CatmullRomCurve3([
+        new THREE.Vector3(tipPos.x * -0.1, -2.3, tipPos.z * -0.1),
+        new THREE.Vector3(0, -1.35, 0),
+        new THREE.Vector3(tipPos.x * 0.55, height * 0.45, tipPos.z * 0.55),
+        new THREE.Vector3(tipPos.x * 1.15, height + 0.35, tipPos.z * 1.15)
+      ]);
+      const eucMat = new THREE.MeshStandardMaterial({
+        color: 0x5eead4,
+        roughness: 0.6,
+        side: THREE.DoubleSide
+      });
+      group.add(new THREE.Mesh(new THREE.TubeGeometry(curve, 12, 0.025, 5, false), eucMat));
+
+      const roundLeaf = new THREE.CylinderGeometry(0.22, 0.22, 0.02, 10);
+      for (let i = 0; i < 9; i++) {
+        const t = 0.42 + (i / 9) * 0.55;
+        const pt = curve.getPoint(t);
+        const side = i % 2 === 0 ? 1 : -1;
+        const scale = 1.15 - (i / 9) * 0.55;
+        const leaf = new THREE.Mesh(roundLeaf, eucMat);
+        leaf.scale.set(scale, 1, scale * 0.9);
+        leaf.position.set(pt.x + side * 0.14 * scale, pt.y, pt.z);
+        leaf.rotation.set(0.35, i * 0.5, side * 0.45);
+        group.add(leaf);
+      }
+      return group;
+    }
+
+    // Pleated Paper Wrap + Ribbon Bow
+    function createPleatedWrap(ribbonHex) {
+      const wrapGroup = new THREE.Group();
+
+      const radialSegs = 28;
+      const wrapGeom = new THREE.CylinderGeometry(1.45, 0.22, 2.45, radialSegs, 4, true);
+      const pos = wrapGeom.attributes.position;
+      for (let i = 0; i < pos.count; i++) {
+        const x = pos.getX(i);
+        const y = pos.getY(i);
+        const z = pos.getZ(i);
+        const angle = Math.atan2(z, x);
+        const topFactor = (y + 1.225) / 2.45;
+        const pleat = Math.sin(angle * 14) * 0.09 * topFactor;
+        const scallop = Math.cos(angle * 7) * 0.14 * Math.pow(topFactor, 2);
+        const r = Math.hypot(x, z) + pleat;
+        pos.setX(i, Math.cos(angle) * r);
+        pos.setZ(i, Math.sin(angle) * r);
+        pos.setY(i, y + scallop);
+      }
+      wrapGeom.computeVertexNormals();
+
+      const wrapMat = new THREE.MeshStandardMaterial({
+        color: 0xe7d8c9,
+        side: THREE.DoubleSide,
+        roughness: 0.85
+      });
+      const wrapMesh = new THREE.Mesh(wrapGeom, wrapMat);
+      wrapMesh.position.y = -0.9;
+      wrapGroup.add(wrapMesh);
+
+      const ribbonMat = new THREE.MeshStandardMaterial({
+        color: ribbonHex,
+        roughness: 0.3,
+        side: THREE.DoubleSide
+      });
+      const band = new THREE.Mesh(new THREE.TorusGeometry(0.36, 0.055, 6, 18), ribbonMat);
+      band.rotation.x = Math.PI / 2;
+      band.position.y = -1.35;
+      wrapGroup.add(band);
+
+      for (const dir of [-1, 1]) {
+        const loop = new THREE.Mesh(new THREE.TorusGeometry(0.18, 0.045, 6, 12), ribbonMat);
+        loop.scale.set(1.4, 0.75, 0.5);
+        loop.position.set(dir * 0.22, -1.35, 0.38);
+        loop.rotation.set(0.2, dir * 0.35, dir * 0.25);
+        wrapGroup.add(loop);
+
+        const tail = new THREE.Mesh(createBotanicalLeaf(0.14, 0.65), ribbonMat);
+        tail.position.set(dir * 0.06, -1.38, 0.38);
+        tail.rotation.set(2.8, dir * 0.2, dir * -0.25);
+        wrapGroup.add(tail);
+      }
+
+      return wrapGroup;
+    }
+
+    function buildBouquet() {
+      while (bouquetGroup.children.length) {
+        bouquetGroup.remove(bouquetGroup.children[0]);
+      }
+
+      const items = [];
+      state.selected.forEach(type => {
+        const count = FLOWER_TYPES[type].count;
+        for (let i = 0; i < count; i++) items.push(type);
+      });
+
+      items.forEach((type, idx) => {
+        const total = items.length;
+        const frac = (idx + 0.5) / total;
+        const angle = idx * 2.39996;
+        const spread = 0.22 + Math.sqrt(frac) * 1.45;
+        const height = 1.85 - frac * 0.65 + (Math.random() - 0.5) * 0.18;
+
+        const tipPos = new THREE.Vector3(
+          Math.cos(angle) * spread,
+          height,
+          Math.sin(angle) * spread
+        );
+
+        if (type === 'eucalyptus') {
+          bouquetGroup.add(createEucalyptusSprig(height, tipPos));
+          return;
+        }
+
+        bouquetGroup.add(createStem(height, tipPos));
+
+        let head;
+        if (type === 'rose') head = createRoseHead();
+        else if (type === 'lily') head = createLilyHead();
+        else if (type === 'sunflower') head = createSunflowerHead();
+        else head = createTulipHead();
+
+        head.position.copy(tipPos);
+        head.lookAt(tipPos.x * 2.4, tipPos.y + 1.6, tipPos.z * 2.4);
+        bouquetGroup.add(head);
+      });
+
+      bouquetGroup.add(createPleatedWrap(state.ribbon));
+    }
+
+    // Floating ASCII sparkles
+    const sparkleGroup = new THREE.Group();
+    scene.add(sparkleGroup);
+    const sparkleMat = new THREE.MeshBasicMaterial({ color: 0xfbcfe8 });
+    const sparkleGeom = new THREE.OctahedronGeometry(0.045, 0);
+    const sparkles = [];
+    for (let i = 0; i < 18; i++) {
+      const s = new THREE.Mesh(sparkleGeom, sparkleMat);
+      s.position.set(
+        (Math.random() - 0.5) * 6.5,
+        (Math.random() - 0.5) * 5.5,
+        (Math.random() - 0.5) * 6.5
+      );
+      s.userData.speed = 0.004 + Math.random() * 0.005;
+      sparkleGroup.add(s);
+      sparkles.push(s);
+    }
+
+    // UI Controls
+    const flowerListEl = document.getElementById('flower-list');
+    Object.entries(FLOWER_TYPES).forEach(([key, info]) => {
+      const label = document.createElement('label');
+      label.className = 'flower-item';
+      const cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.checked = state.selected.has(key);
+      cb.addEventListener('change', () => {
+        if (cb.checked) state.selected.add(key);
+        else if (state.selected.size > 1) state.selected.delete(key);
+        else cb.checked = true;
+        buildBouquet();
+        syncURL();
+      });
+
+      const swatch = document.createElement('span');
+      swatch.className = 'swatch';
+      swatch.style.background = info.color;
+
+      label.append(cb, swatch, document.createTextNode(info.label));
+      flowerListEl.appendChild(label);
+    });
+
+    const ribbonInput = document.getElementById('ribbon-color');
+    ribbonInput.value = state.ribbon;
+    ribbonInput.addEventListener('input', e => {
+      state.ribbon = e.target.value;
+      buildBouquet();
+      syncURL();
+    });
+
+    const noteInput = document.getElementById('note-input');
+    const noteText = document.getElementById('note-text');
+    noteInput.value = state.note;
+    noteText.textContent = state.note;
+    noteInput.addEventListener('input', e => {
+      state.note = e.target.value;
+      noteText.textContent = state.note;
+      syncURL();
+    });
+
+    function syncURL() {
+      const url = new URL(window.location);
+      url.searchParams.set('flowers', Array.from(state.selected).join(','));
+      url.searchParams.set('ribbon', state.ribbon);
+      if (state.note) url.searchParams.set('note', state.note);
+      else url.searchParams.delete('note');
+      window.history.replaceState({}, '', url);
+    }
+
+    const copyBtn = document.getElementById('copy-link');
+    copyBtn.addEventListener('click', () => {
+      navigator.clipboard.writeText(window.location.href);
+      copyBtn.textContent = 'Link Copied!';
+      setTimeout(() => (copyBtn.textContent = 'Copy Shareable Link'), 1800);
+    });
+
+    const panel = document.getElementById('control-panel');
+    const toggleBtn = document.getElementById('toggle-ui');
+    toggleBtn.addEventListener('click', () => {
+      panel.classList.toggle('collapsed');
+      toggleBtn.textContent = panel.classList.contains('collapsed') ? 'Customize Bouquet' : 'Close';
+    });
+
+    buildBouquet();
+    syncURL();
+
+    let resizeTimer;
+    window.addEventListener('resize', () => {
+      clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(() => {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        effect.setSize(window.innerWidth, window.innerHeight);
+      }, 120);
+    });
+
+    function animate() {
+      requestAnimationFrame(animate);
+      controls.update();
+      sparkles.forEach(s => {
+        s.position.y += s.userData.speed;
+        s.rotation.y += 0.02;
+        if (s.position.y > 3.2) s.position.y = -2.6;
+      });
+      effect.render(scene, camera);
+    }
+    animate();
+  </script>
+</body>
+</html>
