@@ -140,11 +140,12 @@
       margin-top: 0.35rem;
     }
   </style>
+
   <script type="importmap">
     {
       "imports": {
-        "three": "./vendor/three.module.js",
-        "three/addons/": "./vendor/addons/"
+        "three": "https://unpkg.com/three@0.169.0/build/three.module.js",
+        "three/addons/": "https://unpkg.com/three@0.169.0/examples/jsm/"
       }
     }
   </script>
@@ -265,7 +266,126 @@
       // The GL canvas only needs ~2x the character grid (AsciiEffect downsamples it anyway)
       renderer.setSize(Math.ceil(w * res * 2), Math.ceil(h * res * 2), false);
     }
-    buildEffect();
+
+    // ---- GPU ASCII renderer (default; add ?dom=1 to the URL for the old DOM version) ----
+    // The scene renders into a small offscreen target (2x2 pixels per character cell). A fullscreen shader
+    // then picks one glyph per cell from a texture atlas by brightness and tints it with that cell's color.
+    // Nothing in the DOM changes per frame, so far more cells (a much sharper picture) cost far less.
+    const useDom = params.has('dom');
+    const CELL_W = Number(params.get('cell')) || 4; // character cell width in CSS px (height = 2x). Smaller = sharper
+    // Any characters work (the atlas sorts them by measured ink density). Try adding ▒▓█ or braille.
+    const CHARSET = " .'`^\",:;Il!i><~+_-?][}{1)(|\\/tfjrxnuvczXYUJCLQ0OZmwqpdbkhao*#MW&8%B@$";
+
+    function makeAtlas(gw, gh) {
+      const font = 'bold 100px ui-monospace, Menlo, Consolas, "DejaVu Sans Mono", monospace';
+      const draw = (ctx, ch, x) => {
+        ctx.font = font;
+        const fs = (100 * gw) / ctx.measureText('M').width; // size the font so one glyph advance = one cell width
+        ctx.font = font.replace('100px', fs + 'px');
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillStyle = '#fff';
+        ctx.fillText(ch, x + gw / 2, gh / 2);
+      };
+      const scratch = document.createElement('canvas');
+      scratch.width = gw; scratch.height = gh;
+      const sctx = scratch.getContext('2d', { willReadFrequently: true });
+      const glyphs = [...CHARSET].map(ch => {
+        sctx.clearRect(0, 0, gw, gh);
+        draw(sctx, ch, 0);
+        const d = sctx.getImageData(0, 0, gw, gh).data;
+        let ink = 0;
+        for (let i = 3; i < d.length; i += 4) ink += d[i];
+        return { ch, ink };
+      }).sort((a, b) => a.ink - b.ink); // lightest (space) -> densest
+      const canvas = document.createElement('canvas');
+      canvas.width = gw * glyphs.length; canvas.height = gh;
+      const actx = canvas.getContext('2d');
+      actx.fillStyle = '#000';
+      actx.fillRect(0, 0, canvas.width, canvas.height);
+      glyphs.forEach((g, i) => draw(actx, g.ch, i * gw));
+      const tex = new THREE.CanvasTexture(canvas);
+      tex.minFilter = tex.magFilter = THREE.LinearFilter;
+      tex.generateMipmaps = false;
+      return { tex, count: glyphs.length };
+    }
+
+    const quadScene = new THREE.Scene();
+    const quadCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+    const quadMat = new THREE.ShaderMaterial({
+      uniforms: {
+        tScene: { value: null }, tAtlas: { value: null },
+        uCells: { value: new THREE.Vector2(1, 1) }, uCount: { value: 1 }, uGamma: { value: 0.9 }
+      },
+      vertexShader: `
+        varying vec2 vUv;
+        void main() { vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }`,
+      fragmentShader: `
+        uniform sampler2D tScene;
+        uniform sampler2D tAtlas;
+        uniform vec2 uCells;
+        uniform float uCount;
+        uniform float uGamma;
+        varying vec2 vUv;
+        void main() {
+          vec2 g = vUv * uCells;
+          vec2 cell = floor(g);
+          vec2 local = fract(g);
+          // Bilinear sample at the cell centre = exact average of the 2x2 scene pixels under this cell
+          vec3 col = texture2D(tScene, (cell + 0.5) / uCells).rgb;
+          col = pow(col, vec3(1.0 / 2.2));                 // linear -> display gamma
+          float lum = dot(col, vec3(0.299, 0.587, 0.114));
+          float idx = floor(clamp(pow(lum, uGamma), 0.0, 0.999) * uCount);
+          float m = texture2D(tAtlas, vec2((idx + local.x) / uCount, local.y)).r;
+          float mx = max(max(col.r, col.g), col.b);
+          vec3 tint = mix(col, col / max(mx, 0.05), 0.6);  // keep hue, lift brightness; density carries the shading
+          vec3 bg = vec3(0.035, 0.035, 0.043);
+          gl_FragColor = vec4(mix(bg, tint, m), 1.0);
+        }`,
+      depthTest: false,
+      depthWrite: false
+    });
+    const quad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), quadMat);
+    quad.frustumCulled = false;
+    quadScene.add(quad);
+
+    let sceneRT = null, atlasTex = null;
+    function buildGPU() {
+      const w = window.innerWidth, h = window.innerHeight;
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      const cols = Math.max(1, Math.floor(w / CELL_W));
+      const rows = Math.max(1, Math.floor(h / (CELL_W * 2)));
+      renderer.setPixelRatio(dpr);
+      renderer.setSize(w, h);
+      if (!renderer.domElement.parentNode) {
+        renderer.domElement.style.display = 'block';
+        renderer.domElement.setAttribute('role', 'img');
+        renderer.domElement.setAttribute('aria-label', 'Rotating 3D bouquet of flowers drawn in ASCII characters');
+        container.appendChild(renderer.domElement);
+      }
+      if (sceneRT) sceneRT.dispose();
+      sceneRT = new THREE.WebGLRenderTarget(cols * 2, rows * 2, { samples: 4, minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter });
+      if (atlasTex) atlasTex.dispose();
+      const gw = Math.max(8, Math.round(CELL_W * dpr * 2)); // atlas glyphs at ~2x screen size, so bilinear smooths them
+      const atlas = makeAtlas(gw, gw * 2);
+      atlasTex = atlas.tex;
+      quadMat.uniforms.tScene.value = sceneRT.texture;
+      quadMat.uniforms.tAtlas.value = atlasTex;
+      quadMat.uniforms.uCells.value.set(cols, rows);
+      quadMat.uniforms.uCount.value = atlas.count;
+      camera.aspect = w / h; // must match the screen, not the offscreen target
+      camera.updateProjectionMatrix();
+    }
+
+    const buildView = () => (useDom ? buildEffect() : buildGPU());
+    function renderFrame() {
+      if (useDom) { effect.render(scene, camera); return; }
+      renderer.setRenderTarget(sceneRT);
+      renderer.render(scene, camera);
+      renderer.setRenderTarget(null);
+      renderer.render(quadScene, quadCam);
+    }
+    buildView();
 
     const controls = new OrbitControls(camera, container);
     controls.enableDamping = true;
@@ -883,7 +1003,7 @@
     let resizeTimer;
     window.addEventListener('resize', () => {
       clearTimeout(resizeTimer);
-      resizeTimer = setTimeout(buildEffect, 120);
+      resizeTimer = setTimeout(buildView, 120);
     });
 
     // Cap at ~30fps: the ASCII pass rewrites a large DOM table every frame, and ASCII doesn't need 60fps
@@ -903,13 +1023,13 @@
         if (s.position.y > 3.2) s.position.y = -2.6;
       });
       const t0 = performance.now();
-      effect.render(scene, camera);
+      renderFrame();
 
       // Quality governor: if frames keep coming in slower than ~16fps (software WebGL, weak laptop,
       // huge monitor), shrink the ASCII grid by 30% and rebuild. Ignores long gaps from hidden tabs.
       const slowFrame = (elapsed > 60 && elapsed < 500) || performance.now() - t0 > 30;
       slow = slowFrame ? slow + 1 : Math.max(0, slow - 1);
-      if (slow > 25 && maxCells > 3000) {
+      if (useDom && slow > 25 && maxCells > 3000) {
         maxCells = Math.max(3000, maxCells * 0.7);
         slow = 0;
         buildEffect();
