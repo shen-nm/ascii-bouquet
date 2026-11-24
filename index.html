@@ -22,9 +22,11 @@
     }
     .panel {
       position: fixed;
-      top: 1.25rem;
+      top: 3.75rem;
       right: 1.25rem;
       width: 275px;
+      max-height: calc(100vh - 5rem);
+      overflow-y: auto;
       background: rgba(16, 16, 22, 0.84);
       backdrop-filter: blur(12px);
       border: 1px solid rgba(255, 255, 255, 0.12);
@@ -77,6 +79,7 @@
       transition: background 0.15s;
     }
     .flower-item:hover { background: rgba(255, 255, 255, 0.06); }
+    input[type="checkbox"], input[type="color"] { accent-color: #f472b6; cursor: pointer; }
     .swatch {
       width: 10px;
       height: 10px;
@@ -160,6 +163,16 @@
       <input type="color" id="ribbon-color" value="#f43f5e" />
     </div>
 
+    <div class="row">
+      <span>Outer Wrap</span>
+      <input type="color" id="wrap-color" value="#b08968" />
+    </div>
+
+    <div class="row">
+      <span>Inner Wrap</span>
+      <input type="color" id="tissue-color" value="#ebe1d9" />
+    </div>
+
     <input type="text" id="note-input" placeholder="Write a gift note..." maxlength="80" />
     <button class="btn-share" id="copy-link">Copy Shareable Link</button>
   </div>
@@ -179,7 +192,12 @@
       lily: { label: 'Stargazer Lilies', color: '#ff85b3', count: 4 },
       sunflower: { label: 'Sunflowers', color: '#facc15', count: 3 },
       tulip: { label: 'French Tulips', color: '#fb7185', count: 5 },
-      eucalyptus: { label: 'Silver Eucalyptus', color: '#5eead4', count: 5 }
+      eucalyptus: { label: 'Silver Eucalyptus', color: '#5eead4', count: 5 },
+      daisy: { label: 'Daisies', color: '#f8fafc', count: 5 },
+      peony: { label: 'Blush Peonies', color: '#f9a8d4', count: 3 },
+      hydrangea: { label: 'Hydrangea', color: '#a5b4fc', count: 2 },
+      lavender: { label: 'Lavender', color: '#a78bfa', count: 5 },
+      gypsophila: { label: "Baby's Breath", color: '#e2e8f0', count: 4 }
     };
 
     const params = new URLSearchParams(window.location.search);
@@ -187,9 +205,16 @@
       ? params.get('flowers').split(',').filter(k => FLOWER_TYPES[k])
       : ['rose', 'lily', 'eucalyptus'];
 
+    const hexOr = (v, fallback) => (/^#[0-9a-f]{6}$/i.test(v || '') ? v : fallback);
+    // Default lining for links that predate the inner-wrap picker: the wrap color pushed mostly toward white
+    const tissueFor = hex => new THREE.Color(hex).lerp(new THREE.Color(0xffffff), 0.75);
+    const wrapHex = hexOr(new URLSearchParams(window.location.search).get('wrap'), '#b08968');
+
     const state = {
       selected: new Set(initialFlowers.length ? initialFlowers : ['rose']),
-      ribbon: params.get('ribbon') || '#f43f5e',
+      ribbon: hexOr(params.get('ribbon'), '#f43f5e'),
+      wrap: wrapHex,
+      tissue: hexOr(params.get('tissue'), '#' + tissueFor(wrapHex).getHexString()),
       note: params.get('note') || 'A little bouquet that never wilts'
     };
 
@@ -216,20 +241,31 @@
     const renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: 'high-performance' });
     renderer.setPixelRatio(1);
 
-    const getOptimalResolution = () => (window.innerWidth < 600 ? 0.16 : 0.22);
+    const RES = window.innerWidth < 600 ? 0.16 : 0.22; // ASCII cells per pixel (fixed at startup)
     const ramp = ' .:-=+*#%@';
     const effect = new AsciiEffect(renderer, ramp, {
       invert: true,
       color: true,
-      resolution: getOptimalResolution()
+      resolution: RES
     });
-    effect.setSize(window.innerWidth, window.innerHeight);
+    // AsciiEffect downsamples the GL canvas to its character grid, so a full-window render is wasted work.
+    // Render at 2x the grid instead (keeps some smoothing, far fewer pixels).
+    function applySize() {
+      const w = window.innerWidth, h = window.innerHeight;
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+      effect.setSize(w, h);
+      renderer.setSize(Math.ceil(w * RES * 2), Math.ceil(h * RES * 2), false);
+    }
+    applySize();
+    effect.domElement.setAttribute('role', 'img');
+    effect.domElement.setAttribute('aria-label', 'Rotating 3D bouquet of flowers drawn in ASCII characters');
     effect.domElement.style.backgroundColor = '#09090b';
     document.getElementById('canvas-container').appendChild(effect.domElement);
 
     const controls = new OrbitControls(camera, effect.domElement);
     controls.enableDamping = true;
-    controls.autoRotate = true;
+    controls.autoRotate = !window.matchMedia('(prefers-reduced-motion: reduce)').matches;
     controls.autoRotateSpeed = 1.4;
     controls.target.set(0, 0.35, 0);
 
@@ -423,9 +459,8 @@
         head.add(pivot);
       }
 
-      // Tilt the bloom face slightly forward like a real sunflower
-      head.rotation.x = 0.65;
-      return head;
+      // Face the bloom outward (a plain rotation gets overwritten by lookAt in buildBouquet)
+      return faceOutward(head);
     }
 
     // 4. French Tulip
@@ -481,67 +516,222 @@
       return group;
     }
 
-    // Pleated Paper Wrap + Ribbon Bow
-    function createPleatedWrap(ribbonHex) {
-      const wrapGroup = new THREE.Group();
+    // ---- Extra flower types ----
+    const KEEP = new Set(); // shared geometry/materials that must survive bouquet rebuilds
+    const keep = o => (KEEP.add(o), o);
+    const makeMat = (color, o = {}) => keep(new THREE.MeshStandardMaterial({ color, roughness: 0.5, side: THREE.DoubleSide, ...o }));
 
-      const radialSegs = 28;
-      const wrapGeom = new THREE.CylinderGeometry(1.45, 0.22, 2.45, radialSegs, 4, true);
-      const pos = wrapGeom.attributes.position;
+    // Blooms are built facing +Y; this turns them to face +Z, the direction head.lookAt() aims (outward + up)
+    function faceOutward(bloom) {
+      const g = new THREE.Group();
+      bloom.rotation.x = Math.PI / 2;
+      g.add(bloom);
+      return g;
+    }
+
+    // 6. Daisy
+    const daisyPetal = keep(createCurvedPetal(0.13, 0.52, 0.02, 0.05));
+    const daisyDisc = keep(new THREE.SphereGeometry(0.16, 10, 6).scale(1, 0.55, 1));
+    const daisyWhite = makeMat(0xf8fafc, { roughness: 0.4 });
+    const daisyEye = makeMat(0xfacc15);
+    function createDaisyHead() {
+      const bloom = new THREE.Group();
+      bloom.add(new THREE.Mesh(daisyDisc, daisyEye));
+      for (let i = 0; i < 18; i++) {
+        const pivot = new THREE.Group();
+        pivot.rotation.y = (i / 18) * Math.PI * 2;
+        const p = new THREE.Mesh(daisyPetal, daisyWhite);
+        p.position.z = 0.14;
+        p.rotation.x = Math.PI / 2 - 0.12 + (i % 2) * 0.1;
+        pivot.add(p);
+        bloom.add(pivot);
+      }
+      return faceOutward(bloom);
+    }
+
+    // 7. Peony: four rings of ruffled petals, deep pink in the middle fading to pale outside
+    const peonyPetal = keep(createCurvedPetal(0.5, 0.6, 0.2, 0.2));
+    const peonyMats = [0xf472b6, 0xf9a8d4, 0xfbcfe8, 0xfce7f3].map(c => makeMat(c, { roughness: 0.45 }));
+    function createPeonyHead() {
+      const bloom = new THREE.Group();
+      [[7, 0.15, 0.55], [9, 0.45, 0.72], [11, 0.75, 0.88], [13, 1.05, 1]].forEach(([n, tilt, size], layer) => {
+        for (let i = 0; i < n; i++) {
+          const pivot = new THREE.Group();
+          pivot.rotation.y = (i / n) * Math.PI * 2 + layer * 0.5;
+          const p = new THREE.Mesh(peonyPetal, peonyMats[layer]);
+          p.scale.setScalar(size);
+          p.position.set(0, -layer * 0.03, 0.04 + layer * 0.05);
+          p.rotation.x = tilt;
+          pivot.add(p);
+          bloom.add(pivot);
+        }
+      });
+      return faceOutward(bloom);
+    }
+
+    // 8. Hydrangea: a dome of small florets laid out on a golden-angle spiral
+    const hydFloret = keep(new THREE.SphereGeometry(0.12, 6, 4).scale(1, 0.55, 1));
+    const hydMats = [0x93c5fd, 0xa5b4fc, 0xc4b5fd].map(c => makeMat(c, { roughness: 0.6 }));
+    function createHydrangeaHead() {
+      const bloom = new THREE.Group(), N = 46;
+      for (let i = 0; i < N; i++) {
+        const cosT = 1 - (i + 0.5) / N, sinT = Math.sqrt(1 - cosT * cosT), a = i * 2.39996;
+        const f = new THREE.Mesh(hydFloret, hydMats[i % 3]);
+        f.position.set(Math.cos(a) * sinT * 0.5, cosT * 0.42, Math.sin(a) * sinT * 0.5);
+        bloom.add(f);
+      }
+      return faceOutward(bloom);
+    }
+
+    // 9. Lavender: own stem, florets spiralling up the top third
+    const lavFloret = keep(new THREE.SphereGeometry(0.055, 5, 4).scale(1, 1.5, 1));
+    const lavMats = [0x8b5cf6, 0xa78bfa, 0xc4b5fd].map(c => makeMat(c));
+    function createLavender(height, tip) {
+      const g = new THREE.Group();
+      const curve = new THREE.CatmullRomCurve3([
+        new THREE.Vector3(tip.x * -0.1, -2.3, tip.z * -0.1),
+        new THREE.Vector3(0, -1.35, 0),
+        new THREE.Vector3(tip.x * 0.5, height * 0.45, tip.z * 0.5),
+        new THREE.Vector3(tip.x * 0.95, height + 0.55, tip.z * 0.95)
+      ]);
+      g.add(new THREE.Mesh(new THREE.TubeGeometry(curve, 12, 0.022, 5, false), stemMat));
+      for (let i = 0; i < 34; i++) {
+        const pt = curve.getPoint(0.66 + (i / 34) * 0.34);
+        const a = i * 2.39996, r = 0.07 * (1 - i / 60);
+        const f = new THREE.Mesh(lavFloret, lavMats[i % 3]);
+        f.position.set(pt.x + Math.cos(a) * r, pt.y, pt.z + Math.sin(a) * r);
+        g.add(f);
+      }
+      return g;
+    }
+
+    // 10. Baby's breath: an airy cloud of tiny white blooms on a thin stem
+    const gypDot = keep(new THREE.SphereGeometry(0.06, 5, 4));
+    const gypMat = makeMat(0xf1f5f9, { roughness: 0.7 });
+    function createGypsophila(height, tip) {
+      const g = new THREE.Group();
+      const top = new THREE.Vector3(tip.x * 1.05, height + 0.25, tip.z * 1.05);
+      const curve = new THREE.CatmullRomCurve3([
+        new THREE.Vector3(tip.x * -0.1, -2.3, tip.z * -0.1),
+        new THREE.Vector3(0, -1.35, 0),
+        new THREE.Vector3(tip.x * 0.5, height * 0.45, tip.z * 0.5),
+        top
+      ]);
+      g.add(new THREE.Mesh(new THREE.TubeGeometry(curve, 12, 0.018, 5, false), stemMat));
+      for (let i = 0; i < 28; i++) {
+        const cosT = 1 - (2 * (i + 0.5)) / 28, sinT = Math.sqrt(1 - cosT * cosT), a = i * 2.39996;
+        const r = 0.3 + 0.12 * Math.sin(i * 12.9898); // deterministic "random" spread
+        const d = new THREE.Mesh(gypDot, gypMat);
+        d.position.set(top.x + Math.cos(a) * sinT * r, top.y + cosT * r * 0.8, top.z + Math.sin(a) * sinT * r);
+        g.add(d);
+      }
+      return g;
+    }
+
+    const HEADS = {
+      rose: createRoseHead, lily: createLilyHead, sunflower: createSunflowerHead,
+      tulip: createTulipHead, daisy: createDaisyHead, peony: createPeonyHead, hydrangea: createHydrangeaHead
+    };
+    const FILLERS = { eucalyptus: createEucalyptusSprig, lavender: createLavender, gypsophila: createGypsophila };
+
+    // ---- Paper wrap (pleated kraft outside, tissue inside) + satin ribbon bow ----
+    // Built once and added to the scene directly, so it isn't rebuilt when flowers change.
+    const ribbonMat = new THREE.MeshStandardMaterial({ color: state.ribbon, roughness: 0.3, side: THREE.DoubleSide });
+    const paperOuter = new THREE.MeshStandardMaterial({ color: state.wrap, roughness: 0.9, side: THREE.DoubleSide });
+    const paperInner = new THREE.MeshStandardMaterial({ color: state.tissue, roughness: 0.85, side: THREE.DoubleSide });
+
+    // Cone with sharp radial folds that deepen toward the open top, plus a ruffled rim.
+    // (Old version: 28 segments for 14 pleats = 2 samples per fold, so the folds never showed.)
+    function pleatedCone({ rTop, rBottom, height, pleats, depth, ruffle, ruffles }) {
+      const g = new THREE.CylinderGeometry(rTop, rBottom, height, 144, 16, true);
+      const pos = g.attributes.position;
       for (let i = 0; i < pos.count; i++) {
-        const x = pos.getX(i);
-        const y = pos.getY(i);
-        const z = pos.getZ(i);
-        const angle = Math.atan2(z, x);
-        const topFactor = (y + 1.225) / 2.45;
-        const pleat = Math.sin(angle * 14) * 0.09 * topFactor;
-        const scallop = Math.cos(angle * 7) * 0.14 * Math.pow(topFactor, 2);
-        const r = Math.hypot(x, z) + pleat;
-        pos.setX(i, Math.cos(angle) * r);
-        pos.setZ(i, Math.sin(angle) * r);
-        pos.setY(i, y + scallop);
+        const x = pos.getX(i), y = pos.getY(i), z = pos.getZ(i);
+        const a = Math.atan2(z, x);
+        const t = (y + height / 2) / height; // 0 = gathered bottom, 1 = open top
+        const fold = Math.sin(a * pleats);
+        const r = Math.hypot(x, z) + Math.sign(fold) * Math.pow(Math.abs(fold), 0.6) * depth * (0.2 + 0.8 * t);
+        pos.setXYZ(i, Math.cos(a) * r, y + Math.cos(a * ruffles) * ruffle * t * t * t, Math.sin(a) * r);
       }
-      wrapGeom.computeVertexNormals();
+      g.computeVertexNormals();
+      return g;
+    }
 
-      const wrapMat = new THREE.MeshStandardMaterial({
-        color: 0xe7d8c9,
-        side: THREE.DoubleSide,
-        roughness: 0.85
-      });
-      const wrapMesh = new THREE.Mesh(wrapGeom, wrapMat);
-      wrapMesh.position.y = -0.9;
-      wrapGroup.add(wrapMesh);
+    // Ribbon tail: hangs down, hugs the cone, swallow-tail notch at the end
+    const tailGeom = (() => {
+      const g = new THREE.PlaneGeometry(0.22, 0.95, 1, 10);
+      g.translate(0, -0.475, 0);
+      const p = g.attributes.position;
+      for (let i = 0; i < p.count; i++) {
+        const x = p.getX(i), y = p.getY(i);
+        p.setZ(i, y * 0.5 + Math.sin(y * 7) * 0.025);
+        if (y < -0.94) p.setY(i, y + (0.11 - Math.abs(x)) * 0.9);
+      }
+      g.computeVertexNormals();
+      return g;
+    })();
 
-      const ribbonMat = new THREE.MeshStandardMaterial({
-        color: ribbonHex,
-        roughness: 0.3,
-        side: THREE.DoubleSide
-      });
-      const band = new THREE.Mesh(new THREE.TorusGeometry(0.36, 0.055, 6, 18), ribbonMat);
+    function createPleatedWrap() {
+      const g = new THREE.Group();
+      const inner = new THREE.Mesh(pleatedCone({ rTop: 1.5, rBottom: 0.2, height: 2.6, pleats: 15, depth: 0.07, ruffle: 0.14, ruffles: 9 }), paperInner);
+      inner.position.y = -0.85;
+      const outer = new THREE.Mesh(pleatedCone({ rTop: 1.58, rBottom: 0.28, height: 2.3, pleats: 9, depth: 0.12, ruffle: 0.2, ruffles: 5 }), paperOuter);
+      outer.position.y = -1.0;
+      g.add(inner, outer);
+
+      // The old ribbon (radius 0.36) was buried inside the paper (radius ~0.7 at that height).
+      // This band sits just outside the paper surface, with the bow on the +Z side.
+      const bandY = -1.3, R = 0.92, bz = R + 0.04;
+      const band = new THREE.Mesh(new THREE.TorusGeometry(R, 0.06, 8, 48), ribbonMat);
       band.rotation.x = Math.PI / 2;
-      band.position.y = -1.35;
-      wrapGroup.add(band);
+      band.position.y = bandY;
+      band.scale.z = 2.2; // stretch along the ring axis => a wide flat ribbon
+      g.add(band);
 
-      for (const dir of [-1, 1]) {
-        const loop = new THREE.Mesh(new THREE.TorusGeometry(0.18, 0.045, 6, 12), ribbonMat);
-        loop.scale.set(1.4, 0.75, 0.5);
-        loop.position.set(dir * 0.22, -1.35, 0.38);
-        loop.rotation.set(0.2, dir * 0.35, dir * 0.25);
-        wrapGroup.add(loop);
+      const knot = new THREE.Mesh(new THREE.SphereGeometry(0.13, 10, 8), ribbonMat);
+      knot.scale.set(1, 0.9, 0.8);
+      knot.position.set(0, bandY + 0.02, bz + 0.02);
+      g.add(knot);
 
-        const tail = new THREE.Mesh(createBotanicalLeaf(0.14, 0.65), ribbonMat);
-        tail.position.set(dir * 0.06, -1.38, 0.38);
-        tail.rotation.set(2.8, dir * 0.2, dir * -0.25);
-        wrapGroup.add(tail);
+      for (const d of [-1, 1]) {
+        const loop = new THREE.Mesh(new THREE.TorusGeometry(0.3, 0.07, 8, 24), ribbonMat);
+        loop.scale.set(1.25, 0.8, 0.7);
+        loop.position.set(d * 0.33, bandY + 0.04, bz + 0.02);
+        loop.rotation.set(0.1, d * 0.45, d * 0.3);
+        g.add(loop);
+
+        const tail = new THREE.Mesh(tailGeom, ribbonMat);
+        tail.position.set(d * 0.07, bandY - 0.04, bz);
+        tail.rotation.z = d * 0.2;
+        g.add(tail);
       }
+      return g;
+    }
+    scene.add(createPleatedWrap());
 
-      return wrapGroup;
+    // Deterministic PRNG: same selection => same bouquet, so a shared link looks identical for the recipient
+    function mulberry32(a) {
+      return () => {
+        a |= 0; a = (a + 0x6d2b79f5) | 0;
+        let t = Math.imul(a ^ (a >>> 15), 1 | a);
+        t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+      };
+    }
+
+    // Per-build geometry/materials are disposed on rebuild (prevents GPU memory leaks); these are reused
+    [leafGeom, roseInnerPetal, roseOuterPetal, lilyPetalGeom, sunRayGeom, tulipPetalGeom, stemMat].forEach(o => KEEP.add(o));
+    function clearBouquet() {
+      bouquetGroup.traverse(o => {
+        if (o.geometry && !KEEP.has(o.geometry)) o.geometry.dispose();
+        if (o.material && !KEEP.has(o.material)) o.material.dispose();
+      });
+      bouquetGroup.clear();
     }
 
     function buildBouquet() {
-      while (bouquetGroup.children.length) {
-        bouquetGroup.remove(bouquetGroup.children[0]);
-      }
+      clearBouquet();
+      const rand = mulberry32(2024);
 
       const items = [];
       state.selected.forEach(type => {
@@ -554,7 +744,7 @@
         const frac = (idx + 0.5) / total;
         const angle = idx * 2.39996;
         const spread = 0.22 + Math.sqrt(frac) * 1.45;
-        const height = 1.85 - frac * 0.65 + (Math.random() - 0.5) * 0.18;
+        const height = 1.85 - frac * 0.65 + (rand() - 0.5) * 0.18;
 
         const tipPos = new THREE.Vector3(
           Math.cos(angle) * spread,
@@ -562,25 +752,19 @@
           Math.sin(angle) * spread
         );
 
-        if (type === 'eucalyptus') {
-          bouquetGroup.add(createEucalyptusSprig(height, tipPos));
+        if (FILLERS[type]) {
+          bouquetGroup.add(FILLERS[type](height, tipPos));
           return;
         }
 
         bouquetGroup.add(createStem(height, tipPos));
-
-        let head;
-        if (type === 'rose') head = createRoseHead();
-        else if (type === 'lily') head = createLilyHead();
-        else if (type === 'sunflower') head = createSunflowerHead();
-        else head = createTulipHead();
+        const head = HEADS[type]();
 
         head.position.copy(tipPos);
         head.lookAt(tipPos.x * 2.4, tipPos.y + 1.6, tipPos.z * 2.4);
         bouquetGroup.add(head);
       });
 
-      bouquetGroup.add(createPleatedWrap(state.ribbon));
     }
 
     // Floating ASCII sparkles
@@ -629,7 +813,23 @@
     ribbonInput.value = state.ribbon;
     ribbonInput.addEventListener('input', e => {
       state.ribbon = e.target.value;
-      buildBouquet();
+      ribbonMat.color.set(state.ribbon);
+      syncURL();
+    });
+
+    const wrapInput = document.getElementById('wrap-color');
+    wrapInput.value = state.wrap;
+    wrapInput.addEventListener('input', e => {
+      state.wrap = e.target.value;
+      paperOuter.color.set(state.wrap);
+      syncURL();
+    });
+
+    const tissueInput = document.getElementById('tissue-color');
+    tissueInput.value = state.tissue;
+    tissueInput.addEventListener('input', e => {
+      state.tissue = e.target.value;
+      paperInner.color.set(state.tissue);
       syncURL();
     });
 
@@ -647,15 +847,22 @@
       const url = new URL(window.location);
       url.searchParams.set('flowers', Array.from(state.selected).join(','));
       url.searchParams.set('ribbon', state.ribbon);
+      url.searchParams.set('wrap', state.wrap);
+      url.searchParams.set('tissue', state.tissue);
       if (state.note) url.searchParams.set('note', state.note);
       else url.searchParams.delete('note');
-      window.history.replaceState({}, '', url);
+      try { window.history.replaceState({}, '', url); } catch { /* e.g. file:// — address bar just won't update */ }
     }
 
     const copyBtn = document.getElementById('copy-link');
-    copyBtn.addEventListener('click', () => {
-      navigator.clipboard.writeText(window.location.href);
-      copyBtn.textContent = 'Link Copied!';
+    copyBtn.addEventListener('click', async () => {
+      let label = 'Link Copied!';
+      try {
+        await navigator.clipboard.writeText(window.location.href);
+      } catch {
+        label = 'Copy from address bar'; // clipboard API needs HTTPS + permission
+      }
+      copyBtn.textContent = label;
       setTimeout(() => (copyBtn.textContent = 'Copy Shareable Link'), 1800);
     });
 
@@ -672,24 +879,27 @@
     let resizeTimer;
     window.addEventListener('resize', () => {
       clearTimeout(resizeTimer);
-      resizeTimer = setTimeout(() => {
-        camera.aspect = window.innerWidth / window.innerHeight;
-        camera.updateProjectionMatrix();
-        effect.setSize(window.innerWidth, window.innerHeight);
-      }, 120);
+      resizeTimer = setTimeout(applySize, 120);
     });
 
-    function animate() {
+    // Cap at ~30fps: the ASCII pass rewrites a large DOM table every frame, and ASCII doesn't need 60fps
+    const FRAME_MS = 1000 / 30;
+    let last = 0;
+    function animate(now = 0) {
       requestAnimationFrame(animate);
+      const elapsed = now - last;
+      if (elapsed < FRAME_MS - 2) return;
+      last = now;
+      const dt = Math.min(elapsed / 16.7, 3); // keeps sparkle speed independent of frame rate
       controls.update();
       sparkles.forEach(s => {
-        s.position.y += s.userData.speed;
-        s.rotation.y += 0.02;
+        s.position.y += s.userData.speed * dt;
+        s.rotation.y += 0.02 * dt;
         if (s.position.y > 3.2) s.position.y = -2.6;
       });
       effect.render(scene, camera);
     }
-    animate();
+    requestAnimationFrame(animate);
   </script>
 </body>
 </html>
