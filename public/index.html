@@ -439,6 +439,92 @@
       return geom;
     }
 
+    // ---- Shared helpers for the flower models ----
+    const KEEP = new Set(); // shared geometry/materials that must survive bouquet rebuilds
+    const keep = o => (KEEP.add(o), o);
+    const makeMat = (color, o = {}) => keep(new THREE.MeshStandardMaterial({ color, roughness: 0.5, side: THREE.DoubleSide, ...o }));
+    const vcMat = (o = {}) => makeMat(0xffffff, { vertexColors: true, ...o }); // material that uses per-vertex colours
+
+    // Generic petal. cup = belly, curl > 0 wraps the tip inward (< 0 rolls it outward), tipRound = outline exponent
+    // (~0.4 blunt ... 1 pointed), ripple = wavy edge, peak < 1 pushes the widest point toward the tip,
+    // colorFn(u, v, color) optionally writes per-vertex colours.
+    function createPetalGeom(width, length, cup, curl, tipRound = 0.5, ripple = 0, peak = 0.8, colorFn = null) {
+      const geom = new THREE.PlaneGeometry(width, length, 8, 14);
+      geom.translate(0, length * 0.5, 0);
+      const pos = geom.attributes.position;
+      const colors = colorFn ? new Float32Array(pos.count * 3) : null;
+      const c = new THREE.Color();
+      for (let i = 0; i < pos.count; i++) {
+        const x = pos.getX(i), u = x / (width * 0.5), v = pos.getY(i) / length;
+        pos.setX(i, x * Math.pow(Math.max(0, Math.sin(Math.PI * Math.pow(v, peak))), tipRound));
+        pos.setZ(i, (1 - u * u) * Math.pow(Math.sin(v * Math.PI), 0.7) * cup - Math.pow(v, 2) * curl + Math.sin(v * 14) * ripple * u * u);
+        if (colorFn) { colorFn(u, v, c); colors.set([c.r, c.g, c.b], i * 3); }
+      }
+      if (colors) geom.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+      geom.computeVertexNormals();
+      return geom;
+    }
+
+    // A petal as a curved shell wrapped around the bloom's axis (+Y). span = angle it covers, R0/R1 = base/top radius,
+    // bulge = belly, rim = how far the top edge rolls outward, frill = ruffle, c0 -> c1 = base -> rim colour.
+    // Several overlapping shells read as a cupped rose or a fluffy peony.
+    function createShellPetal({ R0, R1, h, span, bulge = 0.1, rim = 0, frill = 0, c0, c1 }) {
+      const geom = new THREE.PlaneGeometry(1, 1, 10, 14);
+      const pos = geom.attributes.position;
+      const colors = new Float32Array(pos.count * 3);
+      const a = new THREE.Color(c0), b = new THREE.Color(c1), c = new THREE.Color();
+      for (let i = 0; i < pos.count; i++) {
+        const s = pos.getX(i) * 2, t = pos.getY(i) + 0.5; // s: -1..1 across, t: 0..1 up
+        const roll = Math.pow(Math.max(0, (t - 0.7) / 0.3), 2);
+        const r = R0 + (R1 - R0) * t + bulge * Math.sin(Math.PI * t) + rim * roll + frill * Math.sin(s * 6 + t * 4) * t * t;
+        const y = h * t * (1 - 0.3 * s * s) - rim * 0.6 * roll + frill * 0.7 * Math.cos(s * 5) * t * t;
+        const th = s * span * 0.5;
+        pos.setXYZ(i, Math.sin(th) * r, y, Math.cos(th) * r);
+        c.copy(a).lerp(b, Math.pow(t, 2.5));
+        colors.set([c.r, c.g, c.b], i * 3);
+      }
+      geom.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+      geom.computeVertexNormals();
+      return geom;
+    }
+
+    // Bake many (geometry, matrix, colour) parts into ONE BufferGeometry so a whole cluster is a single mesh
+    function bakeParts(parts) {
+      const pos = [], col = [];
+      const v = new THREE.Vector3(), c = new THREE.Color();
+      for (const { geom, matrix, color } of parts) {
+        const g = geom.index ? geom.toNonIndexed() : geom;
+        const p = g.attributes.position;
+        c.set(color);
+        for (let i = 0; i < p.count; i++) {
+          v.fromBufferAttribute(p, i).applyMatrix4(matrix);
+          pos.push(v.x, v.y, v.z);
+          col.push(c.r, c.g, c.b);
+        }
+      }
+      const out = new THREE.BufferGeometry();
+      out.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+      out.setAttribute('color', new THREE.Float32BufferAttribute(col, 3));
+      out.computeVertexNormals();
+      return out;
+    }
+
+    // Domed seed head: n tiny seeds on a golden-angle spiral, colour ramp from centre to rim
+    function bakeDisc(radius, n, seedR, ramp, dome) {
+      const seed = new THREE.SphereGeometry(seedR, 5, 4).scale(1, 0.7, 1);
+      const parts = [];
+      for (let i = 0; i < n; i++) {
+        const f = (i + 0.5) / n, r = radius * Math.sqrt(f), a = i * 2.39996;
+        const y = dome * Math.sqrt(Math.max(0, 1 - Math.pow(r / (radius + 0.02), 2))) + 0.005;
+        parts.push({
+          geom: seed,
+          matrix: new THREE.Matrix4().makeTranslation(Math.cos(a) * r, y, Math.sin(a) * r),
+          color: ramp[Math.min(ramp.length - 1, Math.floor(f * ramp.length))]
+        });
+      }
+      return bakeParts(parts);
+    }
+
     const leafGeom = createBotanicalLeaf(0.45, 1.05);
     const stemMat = new THREE.MeshStandardMaterial({
       color: 0x22c55e,
@@ -468,40 +554,26 @@
       return mesh;
     }
 
-    // 1. Sculpted Velvet Rose
-    const roseInnerPetal = createCurvedPetal(0.42, 0.55, 0.16, 0.05);
-    const roseOuterPetal = createCurvedPetal(0.62, 0.72, 0.18, 0.24);
+    // 1. Velvet rose: overlapping cupped shells (tight bud in the middle, outer petals rolling back at the rim)
+    const roseLayers = [
+      { n: 3, R0: 0.04, R1: 0.09, h: 0.46, span: 2.6, bulge: 0.12, rim: 0, c0: 0x7f1229, c1: 0xa3122f },
+      { n: 5, R0: 0.06, R1: 0.2, h: 0.54, span: 2.0, bulge: 0.12, rim: 0.03, c0: 0x9f1239, c1: 0xc81e4b },
+      { n: 6, R0: 0.09, R1: 0.3, h: 0.58, span: 2.0, bulge: 0.1, rim: 0.09, c0: 0xbe123c, c1: 0xe83a5f },
+      { n: 7, R0: 0.12, R1: 0.4, h: 0.58, span: 1.9, bulge: 0.06, rim: 0.17, c0: 0xd01c46, c1: 0xfb5c7c }
+    ].map(L => ({ ...L, geom: keep(createShellPetal(L)) }));
+    const roseMat = vcMat({ roughness: 0.45 });
     function createRoseHead() {
       const head = new THREE.Group();
-      const innerMat = new THREE.MeshStandardMaterial({
-        color: 0xbe123c,
-        roughness: 0.5,
-        side: THREE.DoubleSide
+      roseLayers.forEach((L, j) => {
+        for (let i = 0; i < L.n; i++) {
+          const pivot = new THREE.Group();
+          pivot.rotation.y = (i / L.n) * Math.PI * 2 + j * 0.9;
+          const petal = new THREE.Mesh(L.geom, roseMat);
+          petal.rotation.x = 0.06 * Math.sin(i * 2.1 + j); // slight lean so no two petals match
+          pivot.add(petal);
+          head.add(pivot);
+        }
       });
-      const outerMat = new THREE.MeshStandardMaterial({
-        color: 0xfb365c,
-        roughness: 0.38,
-        side: THREE.DoubleSide
-      });
-
-      const totalPetals = 16;
-      for (let i = 0; i < totalPetals; i++) {
-        const isOuter = i >= 7;
-        const petal = new THREE.Mesh(
-          isOuter ? roseOuterPetal : roseInnerPetal,
-          isOuter ? outerMat : innerMat
-        );
-        const angle = i * 2.39996;
-        const ring = i / totalPetals;
-        // Radial pivot: each petal leans outward from the bloom's own axis. (A bare rotation.x tipped every
-        // petal toward the same side, so the whole rose looked lopsided and pointed off at an angle.)
-        const pivot = new THREE.Group();
-        pivot.rotation.y = angle;
-        petal.position.set(0, -ring * 0.06, 0.03 + ring * 0.14);
-        petal.rotation.x = 0.18 + ring * 0.72;
-        pivot.add(petal);
-        head.add(pivot);
-      }
       return faceOutward(head);
     }
 
@@ -577,76 +649,77 @@
       return faceOutward(head);
     }
 
-    // 3. Sunflower (fixed radial pivot so petals fan outward cleanly around the seed disc)
-    const sunRayGeom = createCurvedPetal(0.26, 0.92, 0.04, 0.1);
+    // 3. Sunflower: spiral seed head (brown centre, golden ring), bright pointed rays in two layers, green bracts behind
+    const sunLo = new THREE.Color(0xf59e0b), sunHi = new THREE.Color(0xfde047);
+    const sunRayGeom = keep(createPetalGeom(0.3, 0.8, 0.04, 0.12, 0.75, 0, 0.75, (u, v, c) => c.copy(sunLo).lerp(sunHi, Math.min(1, v * 1.3))));
+    const sunBractGeom = keep(createPetalGeom(0.14, 0.45, 0.02, 0, 1.0));
+    const sunBaseGeom = keep(new THREE.SphereGeometry(0.46, 16, 8).scale(1, 0.22, 1));
+    const sunSeedsGeom = keep(bakeDisc(0.44, 170, 0.03, [0x5a2a0c, 0x70380f, 0x8f4a12, 0xb45f10, 0xe08a14], 0.1));
+    const sunRayMat = vcMat({ roughness: 0.4 });
+    const sunSeedMat = vcMat({ roughness: 0.9 });
+    const sunBaseMat = makeMat(0x5a2a0c, { roughness: 0.9 });
+    const sunBractMat = makeMat(0x4d7c0f, { roughness: 0.7 });
     function createSunflowerHead() {
       const head = new THREE.Group();
-
-      // Dark brown seed center
-      const discMat = new THREE.MeshStandardMaterial({ color: 0x78350f, roughness: 0.9 }); // lighter brown so it reads as filled-in ASCII, not a hole
-      const discGeom = new THREE.SphereGeometry(0.44, 14, 10);
-      discGeom.scale(1, 0.28, 1);
-      head.add(new THREE.Mesh(discGeom, discMat));
-
-      // Ring of golden florets around the disc rim
-      const floretMat = new THREE.MeshStandardMaterial({ color: 0xd97706 });
-      const floretGeom = new THREE.SphereGeometry(0.045, 5, 4);
-      for (let i = 0; i < 16; i++) {
-        const a = (i / 16) * Math.PI * 2;
-        const dot = new THREE.Mesh(floretGeom, floretMat);
-        dot.position.set(Math.cos(a) * 0.38, 0.06, Math.sin(a) * 0.38);
-        head.add(dot);
+      head.add(new THREE.Mesh(sunBaseGeom, sunBaseMat), new THREE.Mesh(sunSeedsGeom, sunSeedMat));
+      for (let i = 0; i < 14; i++) {
+        const pivot = new THREE.Group();
+        pivot.rotation.y = (i / 14) * Math.PI * 2 + 0.2;
+        const bract = new THREE.Mesh(sunBractGeom, sunBractMat);
+        bract.position.set(0, -0.03, 0.25);
+        bract.rotation.x = Math.PI / 2 + 0.55;
+        pivot.add(bract);
+        head.add(pivot);
       }
-
-      // Collar ring that covers the seam where the petals meet the disc
-      const collar = new THREE.Mesh(new THREE.TorusGeometry(0.43, 0.05, 6, 28), floretMat);
-      collar.rotation.x = Math.PI / 2;
-      head.add(collar);
-
-      // Two staggered layers of petals radiating outward in the XZ plane
-      const rayMat = new THREE.MeshStandardMaterial({
-        color: 0xfacc15,
-        roughness: 0.4,
-        side: THREE.DoubleSide
-      });
-      const rayCount = 22;
-      [[0, 0, -0.14], [0.5, -0.025, 0.04]].forEach(([offset, y, tilt]) => {
-        for (let i = 0; i < rayCount; i++) {
+      // Rays start inside the disc so no gap shows at the rim
+      [[0, 0, -0.08], [0.5, -0.02, 0.1]].forEach(([offset, y, tilt]) => {
+        for (let i = 0; i < 22; i++) {
           const pivot = new THREE.Group();
-          pivot.rotation.y = ((i + offset) / rayCount) * Math.PI * 2;
-
-          const ray = new THREE.Mesh(sunRayGeom, rayMat);
-          // Start well inside the disc so the narrow petal bases are hidden and no ring gap shows at the rim
+          pivot.rotation.y = ((i + offset) / 22) * Math.PI * 2;
+          const ray = new THREE.Mesh(sunRayGeom, sunRayMat);
           ray.position.set(0, y, 0.22);
-          ray.rotation.x = Math.PI / 2 + tilt + (i % 2 === 0 ? -0.04 : 0.04);
-
+          ray.rotation.x = Math.PI / 2 + tilt + (i % 2 ? 0.03 : -0.03);
           pivot.add(ray);
           head.add(pivot);
         }
       });
-
-      // Face the bloom outward (a plain rotation gets overwritten by lookAt in buildBouquet)
       return faceOutward(head);
     }
 
-    // 4. French Tulip
-    const tulipPetalGeom = createCurvedPetal(0.46, 0.88, 0.24, -0.08);
+    // 4. Tulip: smooth goblet of six tepals that wrap the axis. They are wide at the base and pointed at the tip,
+    // so the 3 outer ones overlap the seams of the 3 inner ones and the inner ones show between the tips.
+    function createTulipTepal(outer) {
+      const geom = new THREE.PlaneGeometry(1, 1, 10, 16);
+      const pos = geom.attributes.position;
+      const colors = new Float32Array(pos.count * 3);
+      const lo = new THREE.Color(0xfda4af), hi = new THREE.Color(outer ? 0xe11d48 : 0xf43f5e), c = new THREE.Color();
+      for (let i = 0; i < pos.count; i++) {
+        const s = pos.getX(i) * 2, t = pos.getY(i) + 0.5;
+        const half = 1.25 * Math.pow(1 - Math.pow(t, 3), 0.55); // angular half-width: wide base, pointed tip
+        const flick = outer ? 0.1 * Math.pow(Math.max(0, (t - 0.85) / 0.15), 2) : 0; // outer tips flick outward
+        const r = (0.08 + 0.3 * Math.sin(Math.PI * Math.pow(t, 0.85)) + 0.1 * t * t + 0.025 * (1 - s * s)) * (outer ? 1 : 0.93) + flick;
+        const th = s * half;
+        pos.setXYZ(i, Math.sin(th) * r, t, Math.cos(th) * r);
+        c.copy(lo).lerp(hi, Math.min(1, t * 1.6)).lerp(lo, Math.pow(Math.abs(s), 4) * 0.45); // paler edges
+        colors.set([c.r, c.g, c.b], i * 3);
+      }
+      geom.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+      geom.computeVertexNormals();
+      return geom;
+    }
+    const tulipOuterGeom = keep(createTulipTepal(true));
+    const tulipInnerGeom = keep(createTulipTepal(false));
+    const tulipMat = vcMat({ roughness: 0.28 });
     function createTulipHead() {
       const head = new THREE.Group();
-      const mat = new THREE.MeshStandardMaterial({
-        color: 0xfb7185,
-        roughness: 0.32,
-        side: THREE.DoubleSide
-      });
-      for (let i = 0; i < 6; i++) {
-        const isInner = i % 2 === 0;
-        const pivot = new THREE.Group();
-        pivot.rotation.y = (i / 6) * Math.PI * 2;
-        const petal = new THREE.Mesh(tulipPetalGeom, mat);
-        petal.position.z = isInner ? 0.07 : 0.11;
-        petal.rotation.x = isInner ? 0.06 : 0.16;
-        pivot.add(petal);
-        head.add(pivot);
+      for (let k = 0; k < 3; k++) {
+        const outer = new THREE.Group();
+        outer.rotation.y = (k / 3) * Math.PI * 2;
+        outer.add(new THREE.Mesh(tulipOuterGeom, tulipMat));
+        const inner = new THREE.Group();
+        inner.rotation.y = (k / 3) * Math.PI * 2 + Math.PI / 3;
+        inner.add(new THREE.Mesh(tulipInnerGeom, tulipMat));
+        head.add(outer, inner);
       }
       return faceOutward(head);
     }
@@ -683,9 +756,6 @@
     }
 
     // ---- Extra flower types ----
-    const KEEP = new Set(); // shared geometry/materials that must survive bouquet rebuilds
-    const keep = o => (KEEP.add(o), o);
-    const makeMat = (color, o = {}) => keep(new THREE.MeshStandardMaterial({ color, roughness: 0.5, side: THREE.DoubleSide, ...o }));
 
     // Blooms are built facing +Y; this turns them to face +Z, the direction head.lookAt() aims (outward + up)
     function faceOutward(bloom) {
@@ -695,63 +765,100 @@
       return g;
     }
 
-    // 6. Daisy
-    const daisyPetal = keep(createCurvedPetal(0.13, 0.52, 0.02, 0.05));
-    const daisyDisc = keep(new THREE.SphereGeometry(0.16, 10, 6).scale(1, 0.55, 1));
+    // 6. Daisy: one layer of broad strap petals (widest near the rounded tip) around a domed yellow disc
+    const daisyPetal = keep(createPetalGeom(0.2, 0.64, 0.03, 0.04, 0.4, 0, 1.25));
+    const daisyBase = keep(new THREE.SphereGeometry(0.16, 10, 6).scale(1, 0.7, 1));
+    const daisyDiscGeom = keep(bakeDisc(0.15, 60, 0.018, [0xf59e0b, 0xfbbf24, 0xfcd34d], 0.08));
     const daisyWhite = makeMat(0xf8fafc, { roughness: 0.4 });
-    const daisyEye = makeMat(0xfacc15);
+    const daisyYellow = makeMat(0xf59e0b);
+    const daisyDiscMat = vcMat({ roughness: 0.8 });
     function createDaisyHead() {
       const bloom = new THREE.Group();
-      bloom.add(new THREE.Mesh(daisyDisc, daisyEye));
-      for (let i = 0; i < 18; i++) {
+      bloom.add(new THREE.Mesh(daisyBase, daisyYellow), new THREE.Mesh(daisyDiscGeom, daisyDiscMat));
+      for (let i = 0; i < 21; i++) {
         const pivot = new THREE.Group();
-        pivot.rotation.y = (i / 18) * Math.PI * 2;
+        pivot.rotation.y = (i / 21) * Math.PI * 2;
         const p = new THREE.Mesh(daisyPetal, daisyWhite);
-        p.position.z = 0.14;
-        p.rotation.x = Math.PI / 2 - 0.12 + (i % 2) * 0.1;
+        p.position.set(0, i % 2 ? -0.012 : 0, 0.13);
+        p.rotation.x = Math.PI / 2 + (i % 2 ? 0.07 : -0.03);
         pivot.add(p);
         bloom.add(pivot);
       }
       return faceOutward(bloom);
     }
 
-    // 7. Peony: four rings of ruffled petals, deep pink in the middle fading to pale outside
-    const peonyPetal = keep(createCurvedPetal(0.5, 0.6, 0.2, 0.2));
-    const peonyMats = [0xf472b6, 0xf9a8d4, 0xfbcfe8, 0xfce7f3].map(c => makeMat(c, { roughness: 0.45 }));
+    // 7. Peony: a fluffy, ruffled mound of broad overlapping shells, blush in the middle fading to white outside
+    const peonyLayers = [
+      { n: 5, R0: 0.05, R1: 0.12, h: 0.5, span: 2.4, bulge: 0.14, frill: 0.03, c0: 0xf472b6, c1: 0xf9a8d4 },
+      { n: 7, R0: 0.08, R1: 0.24, h: 0.58, span: 2.2, bulge: 0.14, frill: 0.05, c0: 0xf9a8d4, c1: 0xfbcfe8 },
+      { n: 9, R0: 0.11, R1: 0.34, h: 0.62, span: 2.1, bulge: 0.12, frill: 0.06, rim: 0.08, c0: 0xfbcfe8, c1: 0xfdeaf3 },
+      { n: 11, R0: 0.14, R1: 0.44, h: 0.62, span: 2.0, bulge: 0.08, frill: 0.07, rim: 0.12, c0: 0xfdeaf3, c1: 0xfff5f9 },
+      { n: 12, R0: 0.17, R1: 0.52, h: 0.56, span: 1.9, bulge: 0.04, frill: 0.07, rim: 0.16, c0: 0xfff0f6, c1: 0xffffff }
+    ].map(L => ({ ...L, geom: keep(createShellPetal(L)) }));
+    const peonyMat = vcMat({ roughness: 0.6 });
     function createPeonyHead() {
       const bloom = new THREE.Group();
-      [[7, 0.15, 0.55], [9, 0.45, 0.72], [11, 0.75, 0.88], [13, 1.05, 1]].forEach(([n, tilt, size], layer) => {
-        for (let i = 0; i < n; i++) {
+      peonyLayers.forEach((L, j) => {
+        for (let i = 0; i < L.n; i++) {
           const pivot = new THREE.Group();
-          pivot.rotation.y = (i / n) * Math.PI * 2 + layer * 0.5;
-          const p = new THREE.Mesh(peonyPetal, peonyMats[layer]);
-          p.scale.setScalar(size);
-          p.position.set(0, -layer * 0.03, 0.04 + layer * 0.05);
-          p.rotation.x = tilt;
-          pivot.add(p);
+          pivot.rotation.y = (i / L.n) * Math.PI * 2 + j * 0.7;
+          const petal = new THREE.Mesh(L.geom, peonyMat);
+          petal.rotation.x = 0.08 * Math.sin(i * 2.3 + j); // uneven lean = ruffled, imperfect look
+          pivot.add(petal);
           bloom.add(pivot);
         }
       });
       return faceOutward(bloom);
     }
 
-    // 8. Hydrangea: a dome of small florets laid out on a golden-angle spiral
-    const hydFloret = keep(new THREE.SphereGeometry(0.12, 6, 4).scale(1, 0.55, 1));
-    const hydMats = [0x93c5fd, 0xa5b4fc, 0xc4b5fd].map(c => makeMat(c, { roughness: 0.6 }));
-    function createHydrangeaHead() {
-      const bloom = new THREE.Group(), N = 46;
+    // 8. Hydrangea: a round ball of four-petalled florets, baked into ONE mesh (mostly blue, lilac toward the bottom)
+    const hydrangeaGeom = keep((() => {
+      const petal = new THREE.CircleGeometry(0.085, 7).scale(1, 1.2, 1).translate(0, 0.075, 0);
+      const blue = new THREE.Color(0x7c8cf8), pink = new THREE.Color(0xe9a6f0);
+      const N = 90, zAxis = new THREE.Vector3(0, 0, 1), parts = [];
       for (let i = 0; i < N; i++) {
-        const cosT = 1 - (i + 0.5) / N, sinT = Math.sqrt(1 - cosT * cosT), a = i * 2.39996;
-        const f = new THREE.Mesh(hydFloret, hydMats[i % 3]);
-        f.position.set(Math.cos(a) * sinT * 0.5, cosT * 0.42, Math.sin(a) * sinT * 0.5);
-        bloom.add(f);
+        const cosT = 1 - ((i + 0.5) / N) * (1 - Math.cos(2.4)), sinT = Math.sqrt(1 - cosT * cosT), a = i * 2.39996;
+        const n = new THREE.Vector3(Math.cos(a) * sinT, cosT, Math.sin(a) * sinT);
+        const q = new THREE.Quaternion().setFromUnitVectors(zAxis, n).multiply(new THREE.Quaternion().setFromAxisAngle(zAxis, i * 1.7));
+        const f = new THREE.Matrix4().compose(n.clone().multiplyScalar(0.48), q, new THREE.Vector3(1, 1, 1));
+        const tone = Math.min(1, Math.max(0, (1 - cosT) / 1.74 + 0.25 * Math.sin(i * 12.9)));
+        const color = blue.clone().lerp(pink, tone * 0.6);
+        for (let k = 0; k < 4; k++) {
+          const m = new THREE.Matrix4().multiplyMatrices(f, new THREE.Matrix4().makeRotationZ((k * Math.PI) / 2).multiply(new THREE.Matrix4().makeRotationX(0.35)));
+          parts.push({ geom: petal, matrix: m, color });
+        }
       }
+      return bakeParts(parts);
+    })());
+    const hydMat = vcMat({ roughness: 0.6 });
+    function createHydrangeaHead() {
+      const bloom = new THREE.Group();
+      const ball = new THREE.Mesh(hydrangeaGeom, hydMat);
+      ball.position.y = 0.35;
+      bloom.add(ball);
       return faceOutward(bloom);
     }
 
-    // 9. Lavender: own stem, florets spiralling up the top third
-    const lavFloret = keep(new THREE.SphereGeometry(0.055, 5, 4).scale(1, 1.5, 1));
-    const lavMats = [0x8b5cf6, 0xa78bfa, 0xc4b5fd].map(c => makeMat(c));
+    // 9. Lavender: dense tapering spike of tubular florets in whorls (one baked mesh) sitting on top of a stem
+    const lavSpikeGeom = keep((() => {
+      const floret = new THREE.ConeGeometry(0.075, 0.24, 5).translate(0, 0.12, 0);
+      const cols = [0x5b21b6, 0x6d28d9, 0x7c3aed, 0x8b5cf6, 0xa78bfa];
+      const W = 10, parts = [];
+      for (let w = 0; w < W; w++) {
+        const f = w / (W - 1), y = 0.02 + f * 0.8, r = 0.07 * (1 - 0.45 * f), size = 1 - 0.4 * f;
+        for (let k = 0; k < 6; k++) {
+          const a = (k / 6) * Math.PI * 2 + w * 0.8;
+          const m = new THREE.Matrix4().compose(
+            new THREE.Vector3(Math.cos(a) * r, y, Math.sin(a) * r),
+            new THREE.Quaternion().setFromEuler(new THREE.Euler(Math.sin(a) * 0.7, 0, -Math.cos(a) * 0.7)), // tip leans outward
+            new THREE.Vector3(size, size, size)
+          );
+          parts.push({ geom: floret, matrix: m, color: cols[((w + k) % 3) + (f > 0.65 ? 2 : 0)] });
+        }
+      }
+      return bakeParts(parts);
+    })());
+    const lavMat = vcMat({ roughness: 0.6 });
     function createLavender(height, tip) {
       const g = new THREE.Group();
       const curve = new THREE.CatmullRomCurve3([
@@ -761,13 +868,11 @@
         new THREE.Vector3(tip.x * 0.95, height + 0.55, tip.z * 0.95)
       ]);
       g.add(new THREE.Mesh(new THREE.TubeGeometry(curve, 12, 0.022, 5, false), stemMat));
-      for (let i = 0; i < 34; i++) {
-        const pt = curve.getPoint(0.66 + (i / 34) * 0.34);
-        const a = i * 2.39996, r = 0.07 * (1 - i / 60);
-        const f = new THREE.Mesh(lavFloret, lavMats[i % 3]);
-        f.position.set(pt.x + Math.cos(a) * r, pt.y, pt.z + Math.sin(a) * r);
-        g.add(f);
-      }
+      const spike = new THREE.Mesh(lavSpikeGeom, lavMat);
+      spike.position.copy(curve.getPointAt(0.84));
+      spike.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), curve.getTangentAt(0.84));
+      spike.scale.setScalar(0.75);
+      g.add(spike);
       return g;
     }
 
@@ -886,7 +991,7 @@
     }
 
     // Per-build geometry/materials are disposed on rebuild (prevents GPU memory leaks); these are reused
-    [leafGeom, roseInnerPetal, roseOuterPetal, lilyPetalGeom, sunRayGeom, tulipPetalGeom, stemMat].forEach(o => KEEP.add(o));
+    [leafGeom, lilyPetalGeom, stemMat].forEach(o => KEEP.add(o));
     function clearBouquet() {
       bouquetGroup.traverse(o => {
         if (o.geometry && !KEEP.has(o.geometry)) o.geometry.dispose();
