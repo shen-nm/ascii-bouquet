@@ -493,20 +493,40 @@
         );
         const angle = i * 2.39996;
         const ring = i / totalPetals;
-        petal.position.set(
-          Math.cos(angle) * (0.03 + ring * 0.14),
-          -ring * 0.06,
-          Math.sin(angle) * (0.03 + ring * 0.14)
-        );
-        petal.rotation.y = -angle + Math.PI / 2;
+        // Radial pivot: each petal leans outward from the bloom's own axis. (A bare rotation.x tipped every
+        // petal toward the same side, so the whole rose looked lopsided and pointed off at an angle.)
+        const pivot = new THREE.Group();
+        pivot.rotation.y = angle;
+        petal.position.set(0, -ring * 0.06, 0.03 + ring * 0.14);
         petal.rotation.x = 0.18 + ring * 0.72;
-        head.add(petal);
+        pivot.add(petal);
+        head.add(pivot);
       }
-      return head;
+      return faceOutward(head);
     }
 
     // 2. Stargazer Lily
-    const lilyPetalGeom = createCurvedPetal(0.48, 1.15, 0.12, 0.42);
+    // Lily petal: narrow base, widest ~70% of the way up, then a rounded (elliptical) tip instead of a spike.
+    // `flare` pushes the tip outward a little so the lip opens like a bell.
+    function createBellPetal(width, length, cupDepth, flare) {
+      const geom = new THREE.PlaneGeometry(width, length, 6, 16);
+      geom.translate(0, length * 0.5, 0);
+      const pos = geom.attributes.position;
+      for (let i = 0; i < pos.count; i++) {
+        const x = pos.getX(i);
+        const y = pos.getY(i);
+        const u = x / (width * 0.5);
+        const v = y / length;
+        const widthProfile = v < 0.7
+          ? 0.3 + 0.7 * Math.sin((v / 0.7) * Math.PI * 0.5)
+          : Math.sqrt(Math.max(0, 1 - Math.pow((v - 0.7) / 0.3, 2)));
+        pos.setX(i, x * widthProfile);
+        pos.setZ(i, (1 - u * u) * Math.pow(Math.sin(v * Math.PI), 0.6) * cupDepth + Math.pow(v, 2.4) * flare);
+      }
+      geom.computeVertexNormals();
+      return geom;
+    }
+    const lilyPetalGeom = createBellPetal(0.46, 0.95, 0.1, 0.3);
     function createLilyHead() {
       const head = new THREE.Group();
       const petalMat = new THREE.MeshStandardMaterial({
@@ -516,15 +536,16 @@
         side: THREE.DoubleSide
       });
       for (let i = 0; i < 6; i++) {
-        const angle = (i / 6) * Math.PI * 2;
+        const pivot = new THREE.Group();
+        pivot.rotation.y = (i / 6) * Math.PI * 2;
         const petal = new THREE.Mesh(lilyPetalGeom, petalMat);
-        petal.rotation.y = angle;
-        petal.rotation.x = 0.85 + (i % 2) * 0.12;
-        head.add(petal);
+        petal.rotation.x = 0.2 + (i % 2) * 0.08; // small tilt = upright bell (was 0.85 = wide star)
+        pivot.add(petal);
+        head.add(pivot);
       }
       const stamenMat = new THREE.MeshStandardMaterial({ color: 0xfde047 });
-      const filamentGeom = new THREE.CylinderGeometry(0.012, 0.012, 0.65, 5);
-      filamentGeom.translate(0, 0.32, 0);
+      const filamentGeom = new THREE.CylinderGeometry(0.012, 0.012, 0.78, 5);
+      filamentGeom.translate(0, 0.39, 0);
       const antherGeom = new THREE.SphereGeometry(0.045, 5, 4);
       antherGeom.scale(0.6, 1.6, 0.6);
 
@@ -534,20 +555,22 @@
         fil.rotation.z = 0.25;
         fil.rotation.y = a;
         const anther = new THREE.Mesh(antherGeom, stamenMat);
-        anther.position.y = 0.65;
+        anther.position.y = 0.78;
         fil.add(anther);
         head.add(fil);
       }
-      return head;
+      // Stamens grow along the bloom's axis, so facing the bloom outward puts them in the middle of the
+      // petals instead of poking out of the base.
+      return faceOutward(head);
     }
 
     // 3. Sunflower (fixed radial pivot so petals fan outward cleanly around the seed disc)
-    const sunRayGeom = createCurvedPetal(0.24, 0.72, 0.04, 0.1);
+    const sunRayGeom = createCurvedPetal(0.26, 0.92, 0.04, 0.1);
     function createSunflowerHead() {
       const head = new THREE.Group();
 
       // Dark brown seed center
-      const discMat = new THREE.MeshStandardMaterial({ color: 0x451a03, roughness: 0.9 });
+      const discMat = new THREE.MeshStandardMaterial({ color: 0x78350f, roughness: 0.9 }); // lighter brown so it reads as filled-in ASCII, not a hole
       const discGeom = new THREE.SphereGeometry(0.44, 14, 10);
       discGeom.scale(1, 0.28, 1);
       head.add(new THREE.Mesh(discGeom, discMat));
@@ -562,26 +585,32 @@
         head.add(dot);
       }
 
-      // Two staggered rings of yellow petals radiating outward in the XZ plane
+      // Collar ring that covers the seam where the petals meet the disc
+      const collar = new THREE.Mesh(new THREE.TorusGeometry(0.43, 0.05, 6, 28), floretMat);
+      collar.rotation.x = Math.PI / 2;
+      head.add(collar);
+
+      // Two staggered layers of petals radiating outward in the XZ plane
       const rayMat = new THREE.MeshStandardMaterial({
         color: 0xfacc15,
         roughness: 0.4,
         side: THREE.DoubleSide
       });
       const rayCount = 22;
-      for (let i = 0; i < rayCount; i++) {
-        const angle = (i / rayCount) * Math.PI * 2;
-        const pivot = new THREE.Group();
-        pivot.rotation.y = angle;
+      [[0, 0, -0.14], [0.5, -0.025, 0.04]].forEach(([offset, y, tilt]) => {
+        for (let i = 0; i < rayCount; i++) {
+          const pivot = new THREE.Group();
+          pivot.rotation.y = ((i + offset) / rayCount) * Math.PI * 2;
 
-        const ray = new THREE.Mesh(sunRayGeom, rayMat);
-        ray.position.set(0, 0, 0.36);
-        // Lay flat radially outward (+Z) with alternating slight tilt
-        ray.rotation.x = Math.PI / 2 + (i % 2 === 0 ? -0.14 : 0.06);
+          const ray = new THREE.Mesh(sunRayGeom, rayMat);
+          // Start well inside the disc so the narrow petal bases are hidden and no ring gap shows at the rim
+          ray.position.set(0, y, 0.22);
+          ray.rotation.x = Math.PI / 2 + tilt + (i % 2 === 0 ? -0.04 : 0.04);
 
-        pivot.add(ray);
-        head.add(pivot);
-      }
+          pivot.add(ray);
+          head.add(pivot);
+        }
+      });
 
       // Face the bloom outward (a plain rotation gets overwritten by lookAt in buildBouquet)
       return faceOutward(head);
@@ -598,15 +627,15 @@
       });
       for (let i = 0; i < 6; i++) {
         const isInner = i % 2 === 0;
-        const angle = (i / 6) * Math.PI * 2;
+        const pivot = new THREE.Group();
+        pivot.rotation.y = (i / 6) * Math.PI * 2;
         const petal = new THREE.Mesh(tulipPetalGeom, mat);
-        const r = isInner ? 0.07 : 0.11;
-        petal.position.set(Math.cos(angle) * r, 0, Math.sin(angle) * r);
-        petal.rotation.y = -angle + Math.PI / 2;
+        petal.position.z = isInner ? 0.07 : 0.11;
         petal.rotation.x = isInner ? 0.06 : 0.16;
-        head.add(petal);
+        pivot.add(petal);
+        head.add(pivot);
       }
-      return head;
+      return faceOutward(head);
     }
 
     // 5. Silver Dollar Eucalyptus Sprig
@@ -868,7 +897,7 @@
         const frac = (idx + 0.5) / total;
         const angle = idx * 2.39996;
         const spread = 0.22 + Math.sqrt(frac) * 1.45;
-        const height = 1.85 - frac * 0.65 + (rand() - 0.5) * 0.18;
+        const height = 1.2 - frac * 0.55 + (rand() - 0.5) * 0.16; // heads sit just above the paper rim
 
         const tipPos = new THREE.Vector3(
           Math.cos(angle) * spread,
